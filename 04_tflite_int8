@@ -1,0 +1,87 @@
+"""
+04_tflite_int8.py - Conversión a TensorFlow Lite (float32, INT8 dinámico, INT8 completo), latencia y dF1 (sección 7.9).
+Latencia medida en el PC (referencia); en el microcontrolador real hay que re-medir (pendiente / HIL).
+"""
+import sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import os, time
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import numpy as np
+import tensorflow as tf
+import common as c
+
+cfg, sc, data = c.load("lstm_cfg.pkl"), c.load("scaler.pkl"), c.load("dataset.pkl")
+W, H, M, sigma = cfg["W"], cfg["H"], cfg["M"], cfg["sigma"]
+model = tf.keras.models.load_model("lstm.keras")
+S = lambda recs: [c.standardize(r, sc) for r in recs]
+Xtr, Xva = S(data["train_normal"]), S(data["val_normal"])
+te_recs = data["test_normal"] + data["test_events"]
+Xte = S(te_recs)
+
+def windows(X):
+    idx = np.arange(W, len(X) - H + 1)
+    return (np.stack([X[i - W:i] for i in idx]).astype("float32"),
+            X[idx + H - 1, 0].astype("float32"), idx + H - 1)
+
+rep = np.concatenate([windows(x)[0][::10] for x in Xtr])[:300]
+def rep_gen():
+    for r in rep: yield [r[None]]
+
+def convert(kind):
+    # batch fijo = 1 (típico de microcontrolador); evita TensorListReserve con forma dinámica
+    run_model = tf.function(lambda x: model(x))
+    cf = run_model.get_concrete_function(tf.TensorSpec([1, W, 4], tf.float32))
+    from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+    cf = convert_variables_to_constants_v2(cf)      # congela pesos como constantes
+    conv = tf.lite.TFLiteConverter.from_concrete_functions([cf], model)
+    if kind != "float32":
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    if kind == "int8_completo":
+        conv.representative_dataset = rep_gen
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        conv.inference_input_type = tf.float32; conv.inference_output_type = tf.float32
+    return conv.convert()
+
+def run(tfl, X):
+    it = tf.lite.Interpreter(model_content=tfl, experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES); it.allocate_tensors()
+    i, o = it.get_input_details()[0], it.get_output_details()[0]
+    xs, ys, pos = windows(X)
+    out = np.empty(len(xs), "float32")
+    for k in range(len(xs)):
+        it.set_tensor(i["index"], xs[k:k + 1]); it.invoke(); out[k] = it.get_tensor(o["index"])[0, 0]
+    s = np.zeros(len(X), "float32"); s[pos] = np.abs(ys - out)
+    return s / sigma
+
+def latency(tfl, n=200):
+    it = tf.lite.Interpreter(model_content=tfl, num_threads=1, experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES); it.allocate_tensors()
+    i = it.get_input_details()[0]
+    x = rep[:1]
+    for _ in range(10): it.set_tensor(i["index"], x); it.invoke()
+    t = []
+    for _ in range(n):
+        t0 = time.perf_counter(); it.set_tensor(i["index"], x); it.invoke(); t.append(time.perf_counter() - t0)
+    return np.median(t) * 1e3, np.percentile(t, 99) * 1e3
+
+# referencia float32 Keras (mismos scores guardados en 03)
+ref = c.load("scores_lstm.pkl")
+res = {}
+import sys
+KINDS = sys.argv[1:] or ["float32", "int8_dinamico"]      # int8_completo: ver nota (puede fallar en TF 2.21)
+for kind in KINDS:
+    try:
+        tfl = convert(kind)
+    except Exception as e:
+        print(f"{kind}: FALLÓ la conversión -> {type(e).__name__}: {str(e)[:150]}"); continue
+    open(f"lstm_{kind}.tflite", "wb").write(tfl)
+    sv = [run(tfl, x) for x in Xva]; st = [run(tfl, x) for x in Xte]
+    r = c.reporte({kind: dict(val=sv, test=st)}, te_recs, m=M, verbose=False)[kind]
+    k = r["metrics"]; l50, l99 = latency(tfl)
+    res[kind] = dict(f1=k["f1"], fp=k["fp"], recall=k["recall"], mda=r["mda"], kb=len(tfl) / 1024, lat50=l50, lat99=l99)
+rk = c.reporte({"keras": ref}, te_recs, m=M, verbose=False)["keras"]
+f1_ref = rk["metrics"]["f1"]
+print(f"\n{'modelo':<16}{'F1':>6}{'dF1[%]':>9}{'recall':>8}{'FP':>4}{'MDA[cm]':>9}{'tamaño[kB]':>12}{'lat p50[ms]':>13}{'lat p99[ms]':>13}")
+print(f"{'keras float32':<16}{f1_ref:6.2f}{0:9.1f}{rk['metrics']['recall']:8.2f}{rk['metrics']['fp']:4d}{rk['mda']*100:9.1f}{'-':>12}{'-':>13}{'-':>13}")
+for n, r in res.items():
+    print(f"{n:<16}{r['f1']:6.2f}{100*(r['f1']-f1_ref)/f1_ref:9.1f}{r['recall']:8.2f}{r['fp']:4d}{r['mda']*100:9.1f}{r['kb']:12.1f}{r['lat50']:13.2f}{r['lat99']:13.2f}")
+print("\nNota: el intervalo de muestreo es 10 s; la inferencia debe ser << 10 s. Latencia en PC, no en MCU.")
+c.save(res, "resultados_04.pkl")
