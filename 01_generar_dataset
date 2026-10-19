@@ -1,0 +1,92 @@
+"""
+01_generar_dataset.py  -  Genera el dataset sintético-físico con partición por evento y año.
+
+Partición (sección 7.5 de la metodología; sin fuga de información):
+  entrenamiento : registros NORMALES de años 2018-2023   (+ eventos de entrenamiento solo para RF)
+  validación    : registros NORMALES de 2024             (early stopping + calibración de umbral)
+  prueba        : registros NORMALES de 2025 + eventos de tsunami nunca vistos (semillas distintas)
+
+Uso:   python 01_generar_dataset.py [--scale 1.0] [--d-buoy 150] [--seed 42]
+Salida: dataset.pkl , fig_01_ejemplo.png
+"""
+import argparse
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import common as c
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--scale", type=float, default=1.0, help="multiplica el nº de registros")
+ap.add_argument("--d-buoy", type=float, default=150.0, help="distancia boya-costa [km]")
+ap.add_argument("--seed", type=int, default=42)
+ap.add_argument("--sig-gm", type=float, default=0.02, help="sigma Gauss-Markov GNSS [m]")
+ap.add_argument("--ndbc-dir", default="data/ndbc")
+args = ap.parse_args()
+
+pool = c.SeaStatePool(args.ndbc_dir)
+S = lambda k: max(4, int(k * args.scale))
+AMPS = [0.02, 0.03, 0.05, 0.08, 0.12, 0.20, 0.40, 0.80]      # amplitud pico en la boya [m]
+
+# son ILUSTRATIVOS: reemplázalos por los de la literatura (Harig et al. 2022; Medina et al. 2021).
+# Tohoku 2011 requiere batimetría de Japón o el registro real DART (ver README).
+ESCENARIOS = {
+    "tipo_Illapel2015": dict(amp=2.0, src=dict(xu=70, wu=70, xs=15, ws=40)),
+    "tipo_Maule2010":   dict(amp=3.0, src=dict(xu=80, wu=100, xs=10, ws=50)),
+}
+
+
+def gen_normals(n, years, seed):
+    r = np.random.default_rng(seed)
+    return [c.make_record(r, pool, int(r.choice(years)), d_buoy=args.d_buoy, sig_gm=args.sig_gm)
+            for _ in range(n)]
+
+
+def gen_events(amps, n_each, year, seed):
+    r = np.random.default_rng(seed)
+    return [c.make_record(r, pool, year, amp=a, d_buoy=args.d_buoy, sig_gm=args.sig_gm)
+            for a in amps for _ in range(n_each)]
+
+
+print("Generando registros (puede tardar unos minutos)...")
+train_normal = gen_normals(S(48), list(range(2018, 2024)), args.seed + 1)
+val_normal = gen_normals(S(32), [2024], args.seed + 2)
+test_normal = gen_normals(S(32), [2025], args.seed + 3)
+rng_tr = np.random.default_rng(args.seed + 4)
+train_events = [c.make_record(rng_tr, pool, int(rng_tr.choice(range(2018, 2024))),
+                              amp=float(np.exp(rng_tr.uniform(np.log(0.02), np.log(1.0)))),
+                              d_buoy=args.d_buoy, sig_gm=args.sig_gm) for _ in range(S(48))]
+test_events = gen_events(AMPS, max(2, int(5 * args.scale)), 2025, args.seed + 5)
+rng_sc = np.random.default_rng(args.seed + 6)
+for name, sc in ESCENARIOS.items():
+    rec = c.make_record(rng_sc, pool, 2025, amp=sc["amp"], d_buoy=args.d_buoy,
+                        sig_gm=args.sig_gm, src=sc["src"])
+    rec["nombre"] = name
+    test_events.append(rec)
+
+data = dict(train_normal=train_normal, val_normal=val_normal, test_normal=test_normal,
+            train_events=train_events, test_events=test_events, args=vars(args))
+c.save(data, "dataset.pkl")
+print({k: len(v) for k, v in data.items() if isinstance(v, list)})
+
+# ---- normalización: SOLO con estadísticos del entrenamiento (evita fuga) -------------------
+X = np.concatenate([r["feats"] for r in train_normal])
+mu, sd = X.mean(0), X.std(0)
+c.save(dict(mu=mu, sd=sd), "scaler.pkl")
+print("sigma de la banda de tsunami en mar normal [cm]:", round(sd[0] * 100, 2))
+
+# ---- figura de ejemplo ---------------------------------------------------------------------
+fig, ax = plt.subplots(3, 1, figsize=(9, 7), sharex=True)
+r = np.random.default_rng(7)
+for a_, (lab, amp) in zip(ax, [("mar normal", None), ("tsunami 8 cm", 0.08), ("tsunami 30 cm", 0.30)]):
+    rec = c.make_record(r, pool, 2025, amp=amp, d_buoy=args.d_buoy, sig_gm=args.sig_gm)
+    a_.plot(rec["t"] / 60, rec["feats"][:, 0] * 100, lw=0.8)
+    if rec["t_b"]:
+        a_.axvline(rec["t_b"] / 60, color="r", ls="--", label="llegada a la boya")
+        a_.axvline(rec["t_coast"] / 60, color="k", ls=":", label="llegada a la costa")
+        a_.legend(loc="upper right")
+    a_.set_ylabel(f"banda [cm]\n{lab}")
+ax[-1].set_xlabel("tiempo [min]")
+plt.tight_layout()
+plt.savefig("fig_01_ejemplo.png", dpi=130)
+print("OK -> dataset.pkl, scaler.pkl, fig_01_ejemplo.png")
