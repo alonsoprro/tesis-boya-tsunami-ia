@@ -7,5 +7,5 @@ Repositorio oficial con los códigos fuente correspondientes al Proyecto de Tít
 * **/Modelos_IA:** Arquitectura LSTM y detección de anomalías (Isolation Forest, Random Forest) desarrollados en TensorFlow/Keras.
 * **/Simulaciones_MATLAB:** Evaluaciones del comportamiento hidrodinámico y propagación.
 
-## Autor
-* [Tu Nombre Apellido] - Universidad [Nombre]
+## Autores
+* [Fernanda Rios y Alonso Avello] - Universidad Mayor
