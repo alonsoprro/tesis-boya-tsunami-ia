@@ -1,0 +1,258 @@
+%% SIMULACION MATLAB - BOYA OCEANOGRAFICA INTELIGENTE
+% Proyecto: Boya basada en GNSS-IMU y Edge AI para deteccion temprana
+% Tramo de estudio: Arica-Iquique, Chile
+%
+% IMPORTANTE:
+% Este archivo contiene simulaciones conceptuales con senales sinteticas.
+% No es un modelo oceanografico validado ni un detector LSTM entrenado.
+% Los resultados dependen de los supuestos explicitados en cada bloque.
+%
+% Compatible con MATLAB base (sin toolboxes adicionales).
+% Ejecutar el archivo completo para generar todas las figuras.
+clear; close all; clc;
+rng(7); % Reproducibilidad de las senales sinteticas
+%% PARAMETROS DE REFERENCIA DEL PROYECTO
+rho = 1025;             % Densidad agua de mar [kg/m^3]
+g = 9.81;               % Gravedad [m/s^2]
+masa_boya = 6000;       % Masa total objetivo [kg]
+masa_limite = 10000;    % Limite de masa [kg]
+distancia_km = 175;     % Escenario de distancia a costa [km]
+profundidad = 3500;     % Profundidad representativa del escenario [m]
+P_media = 35;           % Potencia media [W]
+E_diaria = P_media*24;  % Consumo diario [Wh/dia]
+P_solar = 400;          % Potencia fotovoltaica instalada [Wp]
+fs_IMU = 100;           % Frecuencia IMU [Hz]
+fs_GNSS = 1;            % Frecuencia GNSS [Hz]
+fprintf('\n=== RESUMEN DE PARAMETROS ===\n');
+fprintf('Masa de boya: %.0f kg (limite %.0f kg)\n', masa_boya, masa_limite);
+fprintf('Consumo diario estimado: %.0f Wh/dia\n', E_diaria);
+fprintf('Potencia solar instalada: %.0f Wp\n', P_solar);
+fprintf('Muestreo IMU: %.0f Hz | GNSS: %.0f Hz\n', fs_IMU, fs_GNSS);
+%% SIMULACION 1: SUPERFICIE OCEANICA 3D CON PERTURBACION SINTETICA
+% Superficie ilustrativa: oleaje de fondo + paquete de onda localizado.
+% No resuelve las ecuaciones completas de aguas someras ni usa batimetria real.
+x = linspace(0, 200, 180);  % Distancia ilustrativa [km]
+y = linspace(-30, 30, 90);  % Coordenada transversal [km]
+[X,Y] = meshgrid(x,y);
+t0 = 0.55;                  % Posicion normalizada del centro de perturbacion
+xc = 200*t0;
+sigma_x = 12; sigma_y = 8;
+fondo = 0.08*sin(2*pi*X/32).*cos(2*pi*Y/25);
+perturbacion = 0.45*exp(-((X-xc).^2/(2*sigma_x^2) + Y.^2/(2*sigma_y^2)));
+Z = fondo + perturbacion;
+figure('Name','Simulacion 1 - Superficie 3D','Color','w');
+surf(X,Y,Z,'EdgeColor','none');
+xlabel('Distancia ilustrativa [km]'); ylabel('Coordenada transversal [km]');
+zlabel('Elevacion relativa [m]');
+title('Superficie marina sintetica con perturbacion localizada');
+colorbar; colormap turbo; view(42,32); grid on;
+camlight headlight; lighting gouraud;
+figure('Name','Simulacion 1b - Mapa de calor','Color','w');
+imagesc(x,y,Z); set(gca,'YDir','normal');
+xlabel('Distancia ilustrativa [km]'); ylabel('Coordenada transversal [km]');
+title('Mapa de elevacion relativa de la superficie sintetica');
+colorbar; colormap turbo;
+%% SIMULACION 2: OLEAJE NORMAL VS ANOMALIA SINTETICA
+% La perturbacion se incluye solo para probar el flujo de analisis.
+fs = 2;                    % Muestreo ilustrativo de la senal de altura [Hz]
+T = 15*60;                 % Duracion simulada [s]
+t = (0:1/fs:T-1/fs)';
+ruido = 0.025*randn(size(t));
+oleaje_normal = 0.12*sin(2*pi*t/8) + 0.045*sin(2*pi*t/13) + ruido;
+centro_evento = 8*60;       % Inicio de perturbacion sintetica [s]
+envolvente = exp(-0.5*((t-centro_evento)/45).^2);
+onda_anomala = 0.22*envolvente.*sin(2*pi*(t-centro_evento)/55);
+senal = oleaje_normal + onda_anomala;
+figure('Name','Simulacion 2 - Series temporales','Color','w');
+plot(t/60,oleaje_normal,'Color',[0.2 0.45 0.8]); hold on;
+plot(t/60,senal,'k','LineWidth',1.1);
+xline(centro_evento/60,'--r','Perturbacion sintetica');
+xlabel('Tiempo [min]'); ylabel('Elevacion relativa [m]');
+title('Comparacion de oleaje de fondo y senal con anomalia');
+legend('Oleaje normal sintetico','Senal observada sintetica','Location','best');
+grid on;
+% Espectro unilateral sencillo usando FFT
+N = length(t);
+Yfft = fft(senal-mean(senal));
+P2 = abs(Yfft/N).^2;
+P1 = P2(1:floor(N/2)+1);
+f = fs*(0:floor(N/2))/N;
+figure('Name','Simulacion 2b - Espectro','Color','w');
+plot(f,P1,'LineWidth',1.2); grid on;
+xlabel('Frecuencia [Hz]'); ylabel('Potencia relativa [unidades^2]');
+title('Espectro de la senal sintetica');
+xlim([0 0.5]);
+%% SIMULACION 3: MEDICION GNSS RUIDOSA Y FILTRADO KALMAN 1D
+% Modelo de estado: posicion vertical y velocidad vertical.
+% GNSS se simula a 1 Hz; el estado interno se propaga a 100 Hz.
+T_k = 120; dt = 1/fs_IMU; tk = (0:dt:T_k)';
+N_k = length(tk);
+z_real = 0.10*sin(2*pi*tk/8) + 0.025*sin(2*pi*tk/17);
+% GNSS: medida a 1 Hz, ruido ilustrativo de 5 cm RMS
+idxGNSS = (1:round(fs_IMU/fs_GNSS):N_k)';
+z_gnss = z_real(idxGNSS) + 0.05*randn(numel(idxGNSS),1);
+t_gnss = tk(idxGNSS);
+% Filtro de Kalman: estado [altura; velocidad], aceleracion como entrada.
+A = [1 dt; 0 1];
+B = [0.5*dt^2; dt];
+H = [1 0];
+Q = diag([1e-6 2e-4]);
+R = 0.05^2;
+xhat = [z_gnss(1); 0];
+P = diag([0.1^2 0.1^2]);
+z_est = zeros(N_k,1); z_est(1) = xhat(1);
+j = 1;
+for k = 2:N_k
+   % Aceleracion de referencia sintetica mas ruido de IMU
+   acc = -(0.10*(2*pi/8)^2)*sin(2*pi*tk(k-1)/8) ...
+         -(0.025*(2*pi/17)^2)*sin(2*pi*tk(k-1)/17);
+   acc = acc + 0.015*randn;
+   xpred = A*xhat + B*acc;
+   Ppred = A*P*A' + Q;
+   if j < length(idxGNSS) && k == idxGNSS(j+1)
+       j = j+1;
+       innov = z_gnss(j) - H*xpred;
+       S = H*Ppred*H' + R;
+       K = Ppred*H'/S;
+       xhat = xpred + K*innov;
+       P = (eye(2)-K*H)*Ppred;
+   else
+       xhat = xpred; P = Ppred;
+   end
+   z_est(k) = xhat(1);
+end
+figure('Name','Simulacion 3 - GNSS y Kalman','Color','w');
+plot(tk,z_real,'k','LineWidth',1.5); hold on;
+plot(t_gnss,z_gnss,'o','MarkerSize',3,'Color',[0.85 0.3 0.2]);
+plot(tk,z_est,'b','LineWidth',1.2);
+xlabel('Tiempo [s]'); ylabel('Desplazamiento vertical [m]');
+title('Estimacion vertical ilustrativa mediante filtro de Kalman');
+legend('Estado real simulado','Medicion GNSS ruidosa (1 Hz)', ...
+      'Estimacion filtrada','Location','best'); grid on;
+error_gnss = z_gnss(:) - z_real(idxGNSS);
+error_kalman = z_est - z_real;
+rmse_gnss = sqrt(mean(error_gnss.^2));
+rmse_kalman = sqrt(mean(error_kalman.^2));
+figure('Name','Simulacion 3b - Error de estimacion','Color','w');
+bar([rmse_gnss rmse_kalman]);
+set(gca,'XTickLabel',{'GNSS','Kalman'});
+ylabel('RMSE [m]'); title('Error cuadratico medio en escenario sintetico');
+grid on;
+fprintf('\nRMSE GNSS simulado: %.4f m\nRMSE estimacion Kalman: %.4f m\n', ...
+       rmse_gnss,rmse_kalman);
+%% SIMULACION 4: DETECTOR PRELIMINAR POR UMBRAL (NO ES LSTM)
+% Detector demostrativo basado en amplitud suavizada. Sirve para visualizar
+% detecciones y errores; no equivale a validar Edge AI ni un F1-score real.
+ventana = max(3,round(10*fs));
+senal_suave = movmean(senal,ventana);
+% Umbral ilustrativo definido a partir de una fraccion del maximo absoluto
+umbral = 0.16;
+deteccion = abs(senal_suave) > umbral;
+verdad = abs(onda_anomala) > 0.08; % Etiqueta sintética para la demostración
+TP = sum(deteccion & verdad);
+FP = sum(deteccion & ~verdad);
+FN = sum(~deteccion & verdad);
+TN = sum(~deteccion & ~verdad);
+precision = TP/max(TP+FP,1);
+sensibilidad = TP/max(TP+FN,1);
+F1 = 2*precision*sensibilidad/max(precision+sensibilidad,eps);
+matriz = [TN FP; FN TP];
+figure('Name','Simulacion 4 - Detector','Color','w');
+plot(t/60,senal,'Color',[0.65 0.65 0.65]); hold on;
+plot(t/60,senal_suave,'b','LineWidth',1.2);
+yline(umbral,'--r','Umbral positivo'); yline(-umbral,'--r','Umbral negativo');
+scatter(t(deteccion)/60,senal(deteccion),12,'r','filled');
+xlabel('Tiempo [min]'); ylabel('Elevacion relativa [m]');
+title('Detector preliminar por umbral sobre datos sinteticos');
+legend('Senal','Senal suavizada','Umbral','Location','best'); grid on;
+figure('Name','Simulacion 4b - Matriz de confusion','Color','w');
+imagesc(matriz); axis equal tight; colorbar;
+set(gca,'XTick',[1 2],'XTickLabel',{'Pred. normal','Pred. anomalia'}, ...
+   'YTick',[1 2],'YTickLabel',{'Real normal','Real anomalia'});
+for r=1:2
+   for c=1:2
+       text(c,r,num2str(matriz(r,c)),'HorizontalAlignment','center', ...
+           'FontWeight','bold','Color','w','FontSize',12);
+   end
+end
+title('Matriz de confusion del detector sobre etiquetas sinteticas');
+fprintf('\nDetector por umbral (solo datos sinteticos):\n');
+fprintf('Precision=%.3f | Sensibilidad=%.3f | F1=%.3f\n',precision,sensibilidad,F1);
+fprintf('No reportar este F1 como KPI validado del proyecto.\n');
+%% SIMULACION 5: TIEMPO TEORICO DE PROPAGACION EN AGUAS PROFUNDAS
+% Aproximacion lineal de tsunami: c = sqrt(g*h), para profundidad constante.
+% No incluye batimetria variable, refraccion, dispersion ni interaccion costera.
+dist_km = linspace(25,250,200);
+profundidades = [3000 3500 4000];
+figure('Name','Simulacion 5 - Tiempo de propagacion','Color','w');
+hold on;
+tiempos_min = zeros(length(profundidades),length(dist_km));
+for q=1:length(profundidades)
+   c = sqrt(g*profundidades(q)); % m/s
+   tiempos_min(q,:) = (dist_km*1000/c)/60;
+   plot(dist_km,tiempos_min(q,:),'LineWidth',1.5);
+end
+xline(distancia_km,'--k','Escenario 175 km');
+xlabel('Distancia de propagacion [km]'); ylabel('Tiempo teorico [min]');
+title('Tiempo de viaje aproximado para profundidad constante');
+legend('h = 3000 m','h = 3500 m','h = 4000 m','Location','northwest');
+grid on;
+c_ref = sqrt(g*profundidad);
+t_prop_min = (distancia_km*1000/c_ref)/60;
+t_ref = (distancia_km*1000/c_ref)/60;
+[~,i175] = min(abs(dist_km-175));
+fprintf('\nVelocidad de fase aproximada a h=%.0f m: %.2f m/s\n',profundidad,c_ref);
+fprintf('Tiempo teorico a 175 km: %.2f min\n', t_ref(1));
+fprintf('Este valor es una aproximacion de profundidad constante, no una prediccion operacional.\n');
+figure('Name','Simulacion 5b - Tiempo por profundidad','Color','w');
+bar(profundidades, (distancia_km(1)*1000./sqrt(g*profundidades))/60);
+xlabel('Profundidad [m]'); ylabel('Tiempo para 25 km [min]');
+title('Comparacion ilustrativa de tiempo de viaje para 25 km');
+grid on;
+%% SIMULACION 6: BALANCE ENERGETICO Y AUTONOMIA
+% Modelo diario simple. Radiacion equivalente en horas solares pico y
+% rendimiento global se toman del documento del proyecto.
+horas_sol = 5.8; eta_sistema = 0.75;
+energia_generada = P_solar*horas_sol*eta_sistema; % Wh/dia
+energia_consumida = E_diaria;
+superavit = energia_generada - energia_consumida;
+figure('Name','Simulacion 6 - Balance energetico','Color','w');
+bar([energia_generada energia_consumida]);
+set(gca,'XTickLabel',{'Generacion solar','Consumo del sistema'});
+ylabel('Energia [Wh/dia]'); title('Balance diario estimado de energia');
+grid on;
+fprintf('\nEnergia solar diaria estimada: %.1f Wh/dia\n',energia_generada);
+fprintf('Consumo diario estimado: %.1f Wh/dia\n',energia_consumida);
+fprintf('Balance diario estimado: %+0.1f Wh/dia\n',superavit);
+% Simulacion de estado de carga para 5 dias con tres escenarios solares.
+dias = 0:5;
+SOC0 = 90; capacidad_bateria_Wh = 5000; % supuesto ilustrativo, ajustar al diseno final
+factores_sol = [1.0 0.5 0.0];
+nombres = {'Sol nominal','50% de generacion','Sin generacion'};
+figure('Name','Simulacion 6b - Estado de carga','Color','w');
+hold on;
+for q=1:length(factores_sol)
+   soc = zeros(size(dias)); soc(1)=SOC0;
+   for d=2:length(dias)
+       balance = energia_generada*factores_sol(q) - energia_consumida;
+       soc(d) = min(100,max(0,soc(d-1) + 100*balance/capacidad_bateria_Wh));
+   end
+   plot(dias,soc,'-o','LineWidth',1.5,'DisplayName',nombres{q});
+end
+xlabel('Tiempo [dias]'); ylabel('Estado de carga estimado [%]');
+title('Evolucion ilustrativa de bateria para escenarios solares');
+legend('Location','best'); ylim([0 100]); grid on;
+%% RESUMEN VISUAL DE INDICADORES
+figure('Name','Resumen de indicadores','Color','w');
+tiledlayout(1,3);
+nexttile; bar([masa_boya masa_limite]); set(gca,'XTickLabel',{'Diseno','Limite'});
+ylabel('Masa [kg]'); title('Restriccion de masa'); grid on;
+nexttile; bar([P_solar energia_consumida]); set(gca,'XTickLabel',{'Solar [Wp]','Consumo [Wh/dia]'});
+title('Magnitudes energeticas'); grid on;
+nexttile; bar([rmse_gnss rmse_kalman]); set(gca,'XTickLabel',{'GNSS','Kalman'});
+ylabel('RMSE [m]'); title('Error vertical simulado'); grid on;
+fprintf('\n=== FIN DE SIMULACIONES ===\n');
+fprintf(['Interpretacion: las figuras muestran el comportamiento de modelos y datos sinteticos.\n' ...
+        'Para una validacion de tesis, reemplazar escenarios sinteticos por datos publicos,\n' ...
+        'batimetria documentada y etiquetas verificadas de eventos.\n']);
+
