@@ -1,0 +1,76 @@
+%% Modelo hidrodinamico 1D preliminar de tsunami
+% Ecuaciones linealizadas de aguas someras, profundidad constante.
+% Modelo academico sintetico; no usa batimetria real ni valida un KPI.
+clear; clc; close all;
+g=9.81; H=3500; c=sqrt(g*H);
+L=250e3; dx=250; x=(0:dx:L)'; Nx=numel(x);
+CFL=0.45; dt=CFL*dx/c; Tend=25*60; Nt=ceil(Tend/dt); dt=Tend/Nt;
+fprintf('c = %.2f m/s\n',c);
+fprintf('Tiempo teorico a 175 km = %.2f min\n',(175e3/c)/60);
+% Pulso sintetico de elevacion, con perturbacion positiva y negativa
+% para representar una onda localizada sin desplazamiento permanente
+x0=5e3; sigma=3e3; A=1.0;
+z=(x-x0)/sigma;
+eta=A*z.*exp(0.5-0.5*z.^2);
+u=(c/H)*eta;
+saveEvery=max(1,round(30/dt)); nSaveMax=ceil(Nt/saveEvery)+1;
+etaHist=zeros(Nx,nSaveMax); uHist=zeros(Nx,nSaveMax); tHist=zeros(1,nSaveMax);
+sc=1; etaHist(:,sc)=eta; uHist(:,sc)=u; tHist(sc)=0;
+% Integracion por volumenes finitos con flujo de Rusanov
+for n=1:Nt
+   eL=eta(1:end-1); eR=eta(2:end); uL=u(1:end-1); uR=u(2:end);
+   Fe=0.5*(H*uL+H*uR)-0.5*c*(eR-eL);
+   Fu=0.5*(g*eL+g*eR)-0.5*c*(uR-uL);
+   FeL=H*u(1); FuL=g*eta(1); FeR=H*u(end); FuR=g*eta(end);
+   en=eta; un=u;
+   en(1)=eta(1)-(dt/dx)*(Fe(1)-FeL);
+   un(1)=u(1)-(dt/dx)*(Fu(1)-FuL);
+   en(2:end-1)=eta(2:end-1)-(dt/dx)*(Fe(2:end)-Fe(1:end-1));
+   un(2:end-1)=u(2:end-1)-(dt/dx)*(Fu(2:end)-Fu(1:end-1));
+   en(end)=eta(end)-(dt/dx)*(FeR-Fe(end));
+   un(end)=u(end)-(dt/dx)*(FuR-Fu(end));
+   eta=en; u=un;
+   if mod(n,saveEvery)==0 || n==Nt
+       sc=sc+1; etaHist(:,sc)=eta; uHist(:,sc)=u; tHist(sc)=n*dt;
+   end
+end
+etaHist=etaHist(:,1:sc); uHist=uHist(:,1:sc); tHist=tHist(1:sc);
+% Grafica 1: perfiles espaciales
+figure('Name','Perfiles de elevacion'); hold on; grid on;
+tp=[0 5 10 15 20 25]*60;
+for k=1:numel(tp)
+   [~,it]=min(abs(tHist-tp(k)));
+   plot(x/1000,etaHist(:,it),'LineWidth',1.4,...
+       'DisplayName',sprintf('t = %.0f min',tHist(it)/60));
+end
+xlabel('Distancia desde el origen [km]'); ylabel('Elevacion eta [m]');
+title('Propagacion de perturbacion: aguas someras 1D'); legend('Location','best');
+% Grafica 2: mapa espacio-tiempo
+figure('Name','Mapa espacio-tiempo'); imagesc(tHist/60,x/1000,etaHist);
+axis xy; colorbar; xlabel('Tiempo [min]'); ylabel('Distancia [km]');
+title('Evolucion espacio-temporal de la elevacion eta [m]');
+% Grafica 3: señales en puntos de 150, 175 y 200 km
+figure('Name','Senales en puntos'); hold on; grid on;
+for d=[150 175 200]
+   [~,ix]=min(abs(x-d*1000));
+   plot(tHist/60,etaHist(ix,:),'LineWidth',1.4,...
+       'DisplayName',sprintf('Punto a %d km',d));
+end
+xlabel('Tiempo [min]'); ylabel('Elevacion simulada [m]');
+title('Senales sinteticas en ubicaciones representativas'); legend('Location','best');
+% Grafica 4: tiempo teorico de propagacion
+dist_km=(0:5:220)'; tTheory=(dist_km*1000/c)/60;
+figure('Name','Tiempo teorico'); plot(dist_km,tTheory,'LineWidth',1.8); grid on;
+xlabel('Distancia [km]'); ylabel('Tiempo teorico [min]');
+title('Estimacion teorica con c = sqrt(gH)');
+% Exportar señal para compartir con el modelo de IA
+dTarget=175; [~,ix]=min(abs(x-dTarget*1000));
+datos=table(tHist(:),etaHist(ix,:)',uHist(ix,:)',...
+   'VariableNames',{'tiempo_s','elevacion_m','velocidad_ms'});
+writetable(datos,'senal_hidrodinamica_175km.csv');
+fprintf('CSV creado: senal_hidrodinamica_175km.csv\n');
+fprintf('Maximo absoluto de eta en el dominio: %.4f m\n',max(abs(etaHist(:))));
+% Limitaciones: dominio 1D, profundidad constante, pulso sintetico, sin batimetria,
+% friccion, dispersion, inundacion costera ni validacion con datos reales.
+
+
