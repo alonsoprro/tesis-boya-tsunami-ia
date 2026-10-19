@@ -1,0 +1,61 @@
+"""
+correr_todo.py - Corre el pipeline completo (01, 02, 03, 04, 05) para cada distancia boya-costa y
+guarda cada corrida en su propia carpeta  resultados_<d>km/ . Al final arma resumen_distancias.csv.
+Uso:  python correr_todo.py                 (distancias 150 175 200, escala 1.0)
+      python correr_todo.py --d 150 200 --scale 0.25      (prueba rápida)
+Requisito: perfil_arica.csv ya generado con 00_extraer_batimetria.py (en esta misma carpeta).
+"""
+import argparse, csv, glob, os, shutil, subprocess, sys
+ap = argparse.ArgumentParser()
+ap.add_argument("--d", type=float, nargs="+", default=[150, 175, 200])
+ap.add_argument("--scale", type=float, default=1.0)
+ap.add_argument("--no-sens", action="store_true", help="omitir 05 (sensibilidad), que es lento")
+ap.add_argument("--sufijo", default="", help="se agrega al nombre de la carpeta y del CSV (p. ej. _x3) para no pisar corridas anteriores")
+a = ap.parse_args()
+if not os.path.exists("perfil_arica.csv"):
+    print("AVISO: no existe perfil_arica.csv -> se usará la batimetría placeholder. Corre antes 00_extraer_batimetria.py.")
+py = sys.executable
+SALIDAS = ["dataset.pkl", "scaler.pkl", "scores_baselines.pkl", "scores_lstm.pkl", "lstm_cfg.pkl", "lstm.keras",
+           "resultados_03.pkl", "resultados_04.pkl", "resultados_05.pkl", "*.tflite", "fig_01_ejemplo.png",
+           "fig_03_comparacion.png", "fig_05.png", "log.txt"]
+
+def run(cmd, log):
+    log.write(f"\n$ {' '.join(cmd)}\n"); log.flush()
+    r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+    if r.returncode != 0:
+        print(f"  ERROR en {' '.join(cmd)} (ver log.txt)"); return False
+    return True
+
+filas = []
+for d in a.d:
+    dn = int(d) if float(d).is_integer() else d
+    out = f"resultados_{dn}km{a.sufijo}"; os.makedirs(out, exist_ok=True)
+    print(f"=== boya a {dn} km ===")
+    with open("log.txt", "w", encoding="utf-8") as log:
+        steps = [[py, "01_generar_dataset.py", "--d-buoy", str(d), "--scale", str(a.scale)],
+                 [py, "02_baselines.py"], [py, "03_lstm.py"], [py, "04_tflite_int8.py"]]
+        if not a.no_sens: steps.append([py, "05_incertidumbre.py"])
+        ok = all(run(s, log) for s in steps)
+    if not ok:
+        print("\n----- ÚLTIMAS LÍNEAS DEL ERROR -----")
+        print("".join(open("log.txt", encoding="utf-8", errors="ignore").readlines()[-15:]))
+        print("------------------------------------\nSe detiene en la primera distancia con error. Arréglalo y vuelve a correr.")
+        sys.exit(1)
+    for pat in SALIDAS:
+        for f in glob.glob(pat):
+            shutil.move(f, os.path.join(out, os.path.basename(f)))
+    if not ok: continue
+    import pickle
+    res = pickle.load(open(os.path.join(out, "resultados_03.pkl"), "rb"))
+    for name, r in res.items():
+        k = r["metrics"]
+        filas.append(dict(d_km=dn, metodo=name, F1=round(k["f1"], 3), recall=round(k["recall"], 3),
+                          precision=round(k["precision"], 3), FP=k["fp"], FNR_critico=round(k["fnr_critico"], 3),
+                          FAR_por_h=round(k["far_por_hora"], 3), MDA_cm=round(r["mda"] * 100, 1),
+                          retardo_min=round(k["retardo_med_s"] / 60, 2), holgura_min=round(k["holgura_med_s"] / 60, 2)))
+if filas:
+    with open(f"resumen_distancias{a.sufijo}.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(filas[0])); w.writeheader(); w.writerows(filas)
+    print("\n" + ",".join(filas[0]))
+    for r in filas: print(",".join(str(v) for v in r.values()))
+    print(f"\nGuardado: resumen_distancias{a.sufijo}.csv")
