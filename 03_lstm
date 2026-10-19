@@ -1,0 +1,78 @@
+"""
+03_lstm.py - Detector de anomalías LSTM (sección 7.4): entrena SOLO con mar normal 2018-2023,
+early stopping con validación 2024, umbral calibrado en validación, evaluación en 2025 + eventos no vistos.
+Predice la banda de tsunami H pasos adelante; score = |residuo| / sigma_residuo(validación).
+Salida: lstm.keras, lstm_cfg.pkl, scores_lstm.pkl, resultados_03.pkl, fig_03_comparacion.png
+"""
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import numpy as np
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import common as c
+
+tf.keras.utils.set_random_seed(0)
+W, H, M_PERSIST, STRIDE = 90, 12, 6, 3          # 15 min de contexto, 2 min de horizonte, 60 s de persistencia
+data, sc = c.load("dataset.pkl"), c.load("scaler.pkl")
+S = lambda recs: [c.standardize(r, sc) for r in recs]
+Xtr, Xva = S(data["train_normal"]), S(data["val_normal"])
+te_recs = data["test_normal"] + data["test_events"]
+Xte = S(te_recs)
+
+def windows(X, stride=1):
+    n = len(X)
+    idx = np.arange(W, n - H + 1, stride)
+    xs = np.stack([X[i - W:i] for i in idx])
+    ys = np.array([X[i + H - 1, 0] for i in idx])
+    return xs.astype("float32"), ys.astype("float32"), idx + H - 1   # idx+H-1 = muestra predicha
+
+def stack(Xs, stride):
+    a = [windows(x, stride) for x in Xs]
+    return np.concatenate([p[0] for p in a]), np.concatenate([p[1] for p in a])
+
+xtr, ytr = stack(Xtr, STRIDE)
+xva, yva = stack(Xva, STRIDE)
+print("ventanas train/val:", xtr.shape, xva.shape)
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input((W, 4)),
+    tf.keras.layers.LSTM(32),
+    tf.keras.layers.Dense(16, activation="relu"),
+    tf.keras.layers.Dense(1)])
+model.compile("adam", "mse")
+hist = model.fit(xtr, ytr, validation_data=(xva, yva), epochs=40, batch_size=128, verbose=0,
+                 callbacks=[tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)])
+print("épocas:", len(hist.history["loss"]), " val_loss:", round(min(hist.history["val_loss"]), 4))
+model.save("lstm.keras")
+
+def score_record(X, mdl=model):
+    xs, ys, pos = windows(X, 1)
+    yhat = mdl.predict(xs, batch_size=512, verbose=0)[:, 0]
+    s = np.zeros(len(X), dtype="float32")
+    s[pos] = np.abs(ys - yhat)
+    return s
+
+sv = [score_record(x) for x in Xva]
+sigma = float(np.std(np.concatenate([s[W + H - 1:] for s in sv])))
+sv = [s / sigma for s in sv]
+st = [score_record(x) / sigma for x in Xte]
+c.save(dict(W=W, H=H, sigma=sigma, M=M_PERSIST), "lstm_cfg.pkl")
+sc_l = dict(val=sv, test=st)
+c.save(sc_l, "scores_lstm.pkl")
+
+scores = c.load("scores_baselines.pkl")
+scores["lstm"] = sc_l
+res = c.reporte(scores, te_recs, m=M_PERSIST)
+c.save(res, "resultados_03.pkl")
+
+fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+ax[0].plot(hist.history["loss"], label="train"); ax[0].plot(hist.history["val_loss"], label="val")
+ax[0].set(xlabel="época", ylabel="MSE", title="Entrenamiento LSTM"); ax[0].legend()
+for n, r in res.items():
+    far, rc = r["roc"]; o = np.argsort(far); ax[1].plot(far[o], rc[o], label=n)
+    ax[2].plot(np.array(r["amps"]) * 100, r["p"], "o-", label=n)
+ax[1].set(xlabel="falsas alarmas / h", ylabel="recall", title="Recall vs FAR (barrido θ)"); ax[1].legend()
+ax[2].set(xscale="log", xlabel="amplitud en boya [cm]", ylabel="P(detección)", title="Detección vs amplitud"); ax[2].legend()
+plt.tight_layout(); plt.savefig("fig_03_comparacion.png", dpi=130)
+print("OK")
