@@ -1,0 +1,67 @@
+"""
+05_incertidumbre.py - Análisis de sensibilidad (sección 7.9). Modelo y umbrales FIJOS (calibrados con el
+régimen nominal); se cambia el régimen de PRUEBA: ruido GNSS (sigma Gauss-Markov), batimetría (±20 %) y
+distancia boya-costa. Mide cuánto se degradan F1, MDA y holgura. Salida: resultados_05.pkl, fig_05.png
+"""
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import numpy as np
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import common as c
+
+cfg, sc = c.load("lstm_cfg.pkl"), c.load("scaler.pkl")
+W, H, M, sigma = cfg["W"], cfg["H"], cfg["M"], cfg["sigma"]
+model = tf.keras.models.load_model("lstm.keras")
+base = c.load("scores_baselines.pkl"); lstm_s = c.load("scores_lstm.pkl")
+theta = {"umbral": c.calibrate_threshold(base["umbral"]["val"], M),
+         "lstm": c.calibrate_threshold(lstm_s["val"], M)}
+pool = c.SeaStatePool("data/ndbc")
+AMPS = [0.03, 0.05, 0.08, 0.12, 0.20, 0.40]
+
+def lstm_score(X):
+    idx = np.arange(W, len(X) - H + 1)
+    xs = np.stack([X[i - W:i] for i in idx]).astype("float32")
+    yh = model.predict(xs, batch_size=512, verbose=0)[:, 0]
+    s = np.zeros(len(X), "float32"); s[idx + H - 1] = np.abs(X[idx + H - 1, 0] - yh); return s / sigma
+
+def run(label, n_norm=30, n_ev=6, seed=900, recal=False, **kw):
+    r = np.random.default_rng(seed)
+    recs = [c.make_record(r, pool, 2025, **kw) for _ in range(n_norm)]
+    recs += [c.make_record(r, pool, 2025, amp=a, **kw) for a in AMPS for _ in range(n_ev)]
+    X = [c.standardize(x, sc) for x in recs]
+    out = {}
+    for name, f in [("umbral", lambda x: np.abs(x[:, 0])), ("lstm", lstm_score)]:
+        m = c.evaluate(recs, [f(x) for x in X], theta[name], M)
+        out[name] = dict(f1=m["f1"], recall=m["recall"], fp=m["fp"], holg=m["holgura_med_s"] / 60,
+                         mda=c.detection_vs_amp(m)[2] * 100)
+    if recal:      # umbral RECALIBRADO con mar normal generado con el mismo ruido (calibración adaptativa)
+        rc = np.random.default_rng(seed + 1)
+        cal = [c.standardize(c.make_record(rc, pool, 2024, **kw), sc) for _ in range(16)]
+        for name, f in [("umbral", lambda x: np.abs(x[:, 0])), ("lstm", lstm_score)]:
+            th = c.calibrate_threshold([f(x) for x in cal], M)
+            m = c.evaluate(recs, [f(x) for x in X], th, M)
+            out[name + "_recal"] = dict(f1=m["f1"], recall=m["recall"], fp=m["fp"], holg=m["holgura_med_s"] / 60,
+                                        mda=c.detection_vs_amp(m)[2] * 100)
+    print(f"{label:<26}" + "".join(f"  {n}: F1={v['f1']:.2f} rec={v['recall']:.2f} FP={v['fp']} MDA={v['mda']:.0f}cm hol={v['holg']:.1f}min"
+                                  for n, v in out.items()))
+    return out
+
+R = {}
+print("== Ruido GNSS (sigma Gauss-Markov) ==")
+for s in [0.01, 0.02, 0.05, 0.10]: R[("gnss", s)] = run(f"sig_gm={s} m", sig_gm=s, recal=True)
+print("== Batimetría ×escala (afecta velocidad y amplitud, ley de Green) ==")
+for b in [0.8, 1.0, 1.2]: R[("bat", b)] = run(f"bath_scale={b}", bath_scale=b)
+print("== Distancia boya-costa ==")
+for d in [150, 175, 200]: R[("dist", d)] = run(f"d_buoy={d} km", d_buoy=d)
+c.save(R, "resultados_05.pkl")
+
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+xs = [0.01, 0.02, 0.05, 0.10]
+for n in ["umbral", "lstm"]:
+    ax[0].plot(xs, [R[("gnss", s)][n]["f1"] for s in xs], "o-", label=n)
+    ax[1].plot(xs, [R[("gnss", s)][n]["mda"] for s in xs], "o-", label=n)
+ax[0].set(xlabel="σ GNSS Gauss-Markov [m]", ylabel="F1", title="Sensibilidad al ruido GNSS"); ax[0].legend()
+ax[1].set(xlabel="σ GNSS Gauss-Markov [m]", ylabel="MDA [cm]", title="Amplitud mínima detectable")
+plt.tight_layout(); plt.savefig("fig_05.png", dpi=130); print("OK")
