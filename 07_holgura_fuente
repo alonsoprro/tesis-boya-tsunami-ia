@@ -1,0 +1,33 @@
+"""
+07_holgura_fuente.py - Solo FÍSICA (sin IA): ¿cuánto tiempo pasa entre que la onda pasa por la boya y llega a la costa,
+según dónde esté la fuente del tsunami?   holgura_fisica = t_costa - t_boya   (positiva = la boya avisa ANTES).
+"""
+import numpy as np
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import common as c
+
+AMP = 0.20                                   # amplitud pico en la boya [m]; define el umbral de 1 cm relativo
+XU = list(range(60, 190, 10))                # centro del levantamiento, km desde la costa
+fig, ax = plt.subplots(figsize=(8, 4))
+print("holgura física t_costa - t_boya [min]  (fila = posición de la fuente xu [km]; columna = distancia de la boya)\n")
+print("xu[km] " + "".join(f"{d:>9} km" for d in (150, 175, 200)))
+tabla = {}
+for d in (150, 175, 200):
+    h = []
+    for xu in XU:
+        eb, ec = c.swe_1d(xu, 25.0, xu - 45.0, 35.0, d)
+        ec = ec * AMP / np.abs(eb).max()       # mismo factor para ambas (modelo lineal)
+        eb = eb * AMP / np.abs(eb).max()
+        db, dc = eb - eb[0], ec - ec[0]          # llegada = cambio respecto al estado inicial (no el valor absoluto)
+        tb = np.argmax(np.abs(db) >= 0.01) / c.FS
+        tc = np.argmax(np.abs(dc) >= 0.10 * np.abs(dc).max()) / c.FS
+        h.append((tc - tb) / 60)
+    tabla[d] = h
+    ax.plot(XU, h, "o-", label=f"boya a {d} km")
+for i, xu in enumerate(XU):
+    print(f"{xu:>6} " + "".join(f"{tabla[d][i]:>12.1f}" for d in (150, 175, 200)))
+ax.axhline(0, color="k", lw=0.8); ax.axvline(0, color="k", lw=0)
+ax.set(xlabel="posición de la fuente xu [km desde la costa]", ylabel="t_costa - t_boya [min]",
+       title="Holgura física según la ubicación de la fuente"); ax.legend()
+plt.tight_layout(); plt.savefig("fig_07_holgura.png", dpi=130); print("\nOK -> fig_07_holgura.png")
