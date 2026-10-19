@@ -1,0 +1,43 @@
+"""
+02_baselines.py  -  Líneas base de menor complejidad (sección 7.4, 'Baseline Comparison').
+
+  umbral     : |banda de tsunami| estandarizada (detector más simple posible)
+  isoforest  : Isolation Forest entrenado SOLO con mar normal (mismo régimen que la LSTM)
+  rf         : Random Forest supervisado (referencia 'con etiquetas'; usa eventos de entrenamiento)
+
+Todos usan persistencia de m muestras consecutivas y umbral calibrado en validación.
+Salida: scores_baselines.pkl
+"""
+import numpy as np
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+import common as c
+
+M_PERSIST = 6          # 6 muestras a 0.1 Hz = 60 s sobre el umbral
+data, sc = c.load("dataset.pkl"), c.load("scaler.pkl")
+tr_n, tr_e = data["train_normal"], data["train_events"]
+va, te = data["val_normal"], data["test_normal"] + data["test_events"]
+
+S = lambda recs: [c.standardize(r, sc) for r in recs]
+Xtr_n, Xtr_e, Xva, Xte = S(tr_n), S(tr_e), S(va), S(te)
+
+# --- 1) umbral ----------------------------------------------------------------------------
+f_thr = lambda Xs: np.abs(Xs[:, 0])
+
+# --- 2) Isolation Forest (solo mar normal) ------------------------------------------------
+Ftr = np.concatenate([c.window_features(x) for x in Xtr_n])[::3]
+iso = IsolationForest(n_estimators=200, random_state=0).fit(Ftr)
+f_iso = lambda Xs: -iso.decision_function(c.window_features(Xs))
+
+# --- 3) Random Forest supervisado ---------------------------------------------------------
+Frf = np.concatenate([c.window_features(x) for x in Xtr_n + Xtr_e])
+yrf = np.concatenate([r["label"] for r in tr_n + tr_e])
+rf = RandomForestClassifier(n_estimators=200, max_depth=8, class_weight="balanced",
+                            random_state=0, n_jobs=-1).fit(Frf, yrf)
+f_rf = lambda Xs: rf.predict_proba(c.window_features(Xs))[:, 1]
+
+scores = {}
+for name, f in [("umbral", f_thr), ("isoforest", f_iso), ("rf", f_rf)]:
+    scores[name] = dict(val=[f(x) for x in Xva], test=[f(x) for x in Xte])
+c.save(scores, "scores_baselines.pkl")
+
+res = c.reporte(scores, te, m=M_PERSIST)
