@@ -1,0 +1,40 @@
+"""
+08_significancia.py - ¿Las diferencias entre métodos son reales o ruido de muestreo?  (usa resultados_03.pkl de una corrida)
+  - McNemar exacto sobre los MISMOS eventos (LSTM vs cada baseline), para todos los eventos y solo los críticos (>= A_CRIT).
+  - Intervalos de confianza 95 %: FAR (Poisson exacto) y FNR crítico (Clopper-Pearson).
+"""
+import sys, pickle
+import numpy as np
+from scipy.stats import binomtest, beta, chi2
+import common as c
+
+carpeta = sys.argv[1] if len(sys.argv) > 1 else "."
+res = pickle.load(open(f"{carpeta}/resultados_03.pkl", "rb"))
+filas = {n: np.array(r["metrics"]["filas"], dtype=float) for n, r in res.items()}     # (amp, detectó, retardo, holgura)
+amp = filas["lstm"][:, 0]
+det = {n: f[:, 1] == 1 for n, f in filas.items()}
+crit = amp >= c.A_CRIT
+print(f"Eventos: {len(amp)}  (críticos, amp >= {c.A_CRIT*100:.0f} cm: {crit.sum()})\n")
+
+print("== McNemar exacto (LSTM vs otro método, mismos eventos) ==")
+print(f"{'comparación':<22}{'subconjunto':<12}{'LSTM sí/otro no':>16}{'LSTM no/otro sí':>16}{'p':>9}")
+for otro in [n for n in det if n != "lstm"]:
+    for nombre, m in [("todos", np.ones_like(crit)), ("críticos", crit)]:
+        a, b = det["lstm"][m], det[otro][m]
+        n10, n01 = int(np.sum(a & ~b)), int(np.sum(~a & b))
+        p = binomtest(n10, n10 + n01, 0.5).pvalue if n10 + n01 else 1.0
+        print(f"lstm vs {otro:<14}{nombre:<12}{n10:>16}{n01:>16}{p:>9.3f}")
+
+print("\n== Falsas alarmas: tasa por hora e IC 95 % (Poisson exacto) ==")
+for n, r in res.items():
+    k, h = r["metrics"]["fp"], r["metrics"]["horas_normal"]
+    lo = chi2.ppf(0.025, 2 * k) / 2 / h if k > 0 else 0.0
+    hi = chi2.ppf(0.975, 2 * k + 2) / 2 / h
+    print(f"{n:<10} FP={k}  en {h:.0f} h  ->  {k/h:.4f} /h   IC95 [{lo:.4f}, {hi:.4f}]   (~{k/h*8760:.0f} falsas alarmas/año)")
+
+print("\n== FNR en eventos críticos e IC 95 % (Clopper-Pearson) ==")
+for n in det:
+    fn, N = int(np.sum(~det[n][crit])), int(crit.sum())
+    lo = beta.ppf(0.025, fn, N - fn + 1) if fn > 0 else 0.0
+    hi = beta.ppf(0.975, fn + 1, N - fn) if fn < N else 1.0
+    print(f"{n:<10} {fn}/{N} = {fn/N:.3f}   IC95 [{lo:.3f}, {hi:.3f}]")
