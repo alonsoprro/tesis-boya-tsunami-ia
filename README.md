@@ -8,4 +8,4 @@ Repositorio oficial con los códigos fuente correspondientes al Proyecto de Tít
 * **/Simulaciones_MATLAB:** Evaluaciones del comportamiento hidrodinámico y propagación.
 
 ## Autores
-* [Fernanda Rios y Alonso Avello] - Universidad Mayor
+Fernanda Rios y Alonso Avello - Universidad Mayor
