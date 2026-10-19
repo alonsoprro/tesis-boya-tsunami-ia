@@ -1,0 +1,141 @@
+"""
+06_tohoku_dart.py - Prueba de la LSTM ya entrenada con el tsunami REAL de Tohoku 2011 (boya DART).
+
+Qué hace: (1) lee el registro DART, (2) le quita la marea (ajuste armónico con datos ANTERIORES al sismo),
+(3) recorta la ventana, (4) la suma a N estados del mar sintéticos + ruido GNSS/IMU (misma cadena Kalman
+que el entrenamiento) y (5) mide si la LSTM y el umbral simple alarman.  NO re-entrena nada.
+
+"""
+import os, sys
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import numpy as np
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import common as c
+
+RUTA = sys.argv[1] if len(sys.argv) > 1 else "data/dart/tohoku_dart.txt"
+SISMO = np.datetime64("2011-03-11T05:46:23")     # hora UTC del terremoto de Tohoku (USGS)
+INICIO_MIN = 45      # [min tras el sismo] se descarta antes: ondas sísmicas que el sensor ve como "presión" (NO son tsunami)
+N_REAL = 10          # nº de estados de mar sintéticos sobre los que se superpone el tsunami real
+T0_EXT = 3900.0      # [s] el tsunami se pone a los 65 min del registro de 180 min (como en los eventos sintéticos)
+PRE_HORAS = 72       # [h] horas ANTERIORES al sismo usadas para ajustar la marea (menos deriva del sensor que usar meses)
+T_LLEGADA_MIN = 60 # [min tras el sismo] llegada del tsunami a la estación; None = se estima sola (ver fig_06a_dart.png)
+TOL_MIN = 2.0   # [min] una alarma hasta TOL_MIN antes de la llegada estimada (5 cm) cuenta como deteccion del inicio de la onda; antes de eso = falsa alarma
+ESTACION = (42.617, 152.583)    # (lat, lon) DART 21401 según NDBC; cámbiala si usas otra boya
+EPICENTRO = (38.297, 142.373)   # Tohoku 2011 (USGS)
+
+# ---- 1) lectura --------------------------------------------------------------------------
+filas = [l.split() for l in open(RUTA, encoding="utf-8", errors="ignore") if l.strip() and not l.startswith("#")]
+if len(filas[0]) >= 8:                                   # formato NDBC
+    A = np.array([[float(v) for v in f[:8]] for f in filas])
+    yy = np.where(A[:, 0] < 100, A[:, 0] + 2000, A[:, 0]).astype(int)
+    t_abs = np.array([np.datetime64(f"{y:04d}-{int(m):02d}-{int(d):02d}T{int(h):02d}:{int(mi):02d}:{int(s):02d}")
+                      for y, m, d, h, mi, s in zip(yy, A[:, 1], A[:, 2], A[:, 3], A[:, 4], A[:, 5])])
+    t = (t_abs - SISMO).astype("timedelta64[s]").astype(float)       # s desde el sismo
+    h = A[:, 7]
+    tipo = A[:, 6]                                                   # T: 1 = 15 min, 2 = 1 min, 3 = 15 s
+else:                                                   # CSV 2 columnas
+    filas = [l.replace(",", " ").split() for l in open(RUTA, encoding="utf-8") if l.strip()][1:]
+    t, h = np.array([[float(v) for v in f[:2]] for f in filas]).T
+    tipo = np.full_like(t, np.nan)
+ok = np.isfinite(h) & (h < 9000)                         # DART marca faltantes como 9999.xxx
+t, h, tipo = t[ok], h[ok], tipo[ok]
+o = np.argsort(t); t, h, tipo = t[o], h[o], tipo[o]
+print(f"{len(t)} muestras, de {t[0]/3600:.1f} h a {t[-1]/3600:.1f} h respecto al sismo; paso típico {np.median(np.diff(t)):.0f} s")
+for v, nom in [(1, "15 min"), (2, "1 min"), (3, "15 s")]:
+    print(f"   filas con muestreo de {nom}: {int(np.sum(tipo == v))}")
+ven = (t >= -1800) & (t <= 7200)                          # ventana del evento: de 30 min antes a 2 h después del sismo
+paso = np.median(np.diff(t[ven])) if ven.sum() > 2 else np.inf
+print(f"muestreo mediano alrededor del evento (-30 min a +2 h): {paso:.0f} s")
+if paso > 60:
+    sys.exit("\nERROR: alrededor del terremoto el archivo solo tiene datos cada 15 min. Un tsunami (periodo 10-40 min) NO se puede\n"
+             "analizar con esa resolución. Descarga de NDBC el mismo período con datos de 1 min o 15 s (columna T = 2 o 3):\n"
+             "https://www.ndbc.noaa.gov/dart_data.php?station=21401&start=2011-03-10&end=2011-03-13  (rango máximo: 2 años)")
+
+# ---- 2) quitar la marea: ajuste armónico con datos ANTERIORES al sismo -------------------
+T_M2, T_S2, T_N2, T_K1, T_O1 = 12.4206, 12.0, 12.6583, 23.9345, 25.8193      # periodos [h]
+pre = (t < -600) & (t > -PRE_HORAS * 3600)
+if pre.sum() * np.median(np.diff(t)) < 6 * 3600:
+    print("AVISO: hay menos de 6 h de datos antes del sismo; el ajuste de marea será pobre (ajuste cuadrático).")
+    base = lambda tt: np.stack([np.ones_like(tt), tt / 3600, (tt / 3600) ** 2], 1)
+else:
+    base = lambda tt: np.stack([np.ones_like(tt)] + [f(2 * np.pi * tt / 3600 / P) for P in (T_M2, T_S2, T_N2, T_K1, T_O1)
+                                                      for f in (np.sin, np.cos)] + [tt / 3600], 1)
+coef = np.linalg.lstsq(base(t[pre]), h[pre], rcond=None)[0]
+res = h - base(t) @ coef                                  # residuo = tsunami (+ ruido) respecto a la marea predicha
+print(f"residuo antes del sismo: desv. est. = {res[pre].std()*100:.1f} cm (ruido de fondo del DART)")
+
+# ---- 3) recorte y remuestreo a FS = 2 Hz -----------------------------------------------
+t_ini = INICIO_MIN * 60
+dur = c.DUR_MIN * 60 - T0_EXT
+seg = (t >= t_ini) & (t <= t_ini + dur)
+tg = np.arange(t_ini, min(t_ini + dur, t[seg].max()), 1 / c.FS)
+eta_ext = np.interp(tg, t[seg], res[seg])
+print(f"tsunami recortado: {len(eta_ext)/c.FS/60:.0f} min, amplitud máxima {np.abs(eta_ext).max()*100:.0f} cm")
+# llegada TEÓRICA de referencia: distancia / sqrt(g*h) con h = columna de agua del archivo (profundidad constante: es solo una guía)
+la1, lo1, la2, lo2 = np.radians([EPICENTRO[0], EPICENTRO[1], ESTACION[0], ESTACION[1]])
+dist_km = 2 * 6371 * np.arcsin(np.sqrt(np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2))
+t_teor = dist_km * 1000 / np.sqrt(9.81 * np.median(h[np.abs(t) < 6 * 3600])) / 60
+print(f"distancia epicentro-estacion = {dist_km:.0f} km -> llegada teorica del tsunami ~ {t_teor:.0f} min tras el sismo (referencia)")
+sig_pre = res[pre].std()
+umbral_ll = max(0.05, 5 * sig_pre)
+if T_LLEGADA_MIN is None:
+    hay = np.abs(eta_ext) >= umbral_ll
+    t_arr = float(tg[np.argmax(hay)]) if hay.any() else t_ini
+    print(f"llegada estimada = primer instante con |señal| >= {umbral_ll*100:.0f} cm (5 sigma o 5 cm): {t_arr/60:.1f} min tras el sismo")
+else:
+    t_arr = T_LLEGADA_MIN * 60.0
+    print(f"llegada fijada a mano: {T_LLEGADA_MIN} min tras el sismo")
+if abs(t_arr / 60 - t_teor) > 30:
+    print(f"AVISO: la llegada usada ({t_arr/60:.0f} min) difiere mucho de la teórica ({t_teor:.0f} min). Probablemente estás viendo ondas "
+          f"sísmicas y no el tsunami: sube INICIO_MIN o fija T_LLEGADA_MIN mirando fig_06a_dart.png.")
+fig0, a0 = plt.subplots(figsize=(9, 3.5))
+vis = (t >= -1800) & (t <= 4 * 3600)
+a0.plot(t[vis] / 60, res[vis] * 100, lw=0.7)
+a0.axvline(t_ini / 60, color="gray", ls="--", label="inicio del recorte"); a0.axvline(t_arr / 60, color="r", ls=":", label="llegada usada")
+a0.axvline(t_teor, color="g", ls="-.", label="llegada teórica (referencia)")
+a0.set(xlabel="minutos tras el sismo", ylabel="residuo [cm]", title="Registro DART sin marea"); a0.legend()
+plt.tight_layout(); plt.savefig("fig_06a_dart.png", dpi=130); plt.close(fig0)
+
+# ---- 4) modelo y umbrales ya entrenados -------------------------------------------------
+cfg, sc = c.load("lstm_cfg.pkl"), c.load("scaler.pkl")
+W, H, M, sigma = cfg["W"], cfg["H"], cfg["M"], cfg["sigma"]
+model = tf.keras.models.load_model("lstm.keras")
+sl, sb = c.load("scores_lstm.pkl"), c.load("scores_baselines.pkl")
+th_l, th_u = c.calibrate_threshold(sl["val"], M), c.calibrate_threshold(sb["umbral"]["val"], M)
+
+pool = c.SeaStatePool("data/ndbc")
+rng = np.random.default_rng(2011)
+filas_out = []
+for k in range(N_REAL):
+    rec = c.make_record(rng, pool, 2025, eta_ext=eta_ext, t0_ext=T0_EXT)
+    rec["t_b"] = T0_EXT + (t_arr - t_ini)               # llegada a la boya = llegada estimada del tsunami real (no el 1.er cm de ruido)
+    X = c.standardize(rec, sc)
+    idx = np.arange(W, len(X) - H + 1)
+    xs = np.stack([X[i - W:i] for i in idx]).astype("float32")
+    yh = model.predict(xs, batch_size=512, verbose=0)[:, 0]
+    s_l = np.zeros(len(X), "float32"); s_l[idx + H - 1] = np.abs(X[idx + H - 1, 0] - yh); s_l /= sigma
+    s_u = np.abs(X[:, 0])
+    out = []
+    for nombre, s, th in [("LSTM", s_l, th_l), ("umbral", s_u, th_u)]:
+        ia = c.first_alarm(s, th, M)
+        ta = None if ia is None else rec["t"][ia]
+        out.append((nombre, "NO DETECTA" if ta is None else ("FALSA ALARMA (antes del tsunami)" if ta < rec["t_b"] - TOL_MIN * 60 else "detecta"),
+                    np.nan if ta is None else (ta - rec["t_b"]) / 60))
+    filas_out.append(out)
+    print(f"[{k+1}/{N_REAL}] hs={rec['hs']:.1f} m  " + " | ".join(f"{n}: {e}" + ("" if np.isnan(d) else f" ({d:+.1f} min)") for n, e, d in out))
+    if k == 0: ejemplo = (rec["t"] / 60, X[:, 0], s_l, th_l, rec["t_b"] / 60)
+
+for j, nombre in enumerate(["LSTM", "umbral"]):
+    det = [f[j][1] == "detecta" for f in filas_out]
+    ret = [f[j][2] for f in filas_out if f[j][1] == "detecta"]
+    print(f"\n{nombre}: detecta {sum(det)}/{N_REAL}; retardo mediano tras la llegada estimada: "
+          f"{np.median(ret) if ret else float('nan'):.1f} min")
+
+fig, ax = plt.subplots(2, 1, figsize=(9, 5), sharex=True)
+ax[0].plot(ejemplo[0], ejemplo[1]); ax[0].set_ylabel("banda tsunami\n(estandarizada)")
+ax[1].plot(ejemplo[0], ejemplo[2]); ax[1].axhline(ejemplo[3], color="r", ls="--", label="umbral θ")
+for a_ in ax: a_.axvline(ejemplo[4], color="k", ls=":")
+ax[1].set(xlabel="tiempo [min]", ylabel="score LSTM"); ax[1].legend()
+plt.tight_layout(); plt.savefig("fig_06_tohoku.png", dpi=130); print("OK -> fig_06_tohoku.png")
